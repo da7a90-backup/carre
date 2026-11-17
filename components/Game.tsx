@@ -1,6 +1,7 @@
 'use client';
 
 import { useMemo, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { nextSeat, partnerSeat, teamOfSeat } from '@/lib/game';
 import type { PlayerView } from '@/lib/protocol';
 import { usePeerNet } from '@/hooks/usePeerNet';
@@ -21,10 +22,19 @@ export function Game({
   pid: string;
   name: string;
 }) {
+  const router = useRouter();
   const net = usePeerNet({ roomId, pid, name });
   const { state } = net;
   const [selected, setSelected] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+
+  const onLeave = () => {
+    if (window.confirm('Leave this room?')) {
+      net.leave();
+      setTimeout(() => router.push('/'), 120);
+    }
+  };
 
   const myEmoji = useMemo(() => {
     if (!state) return null;
@@ -34,7 +44,15 @@ export function Game({
   if (!state) {
     return (
       <div className="room">
-        <Topbar roomId={roomId} net={net} onCopy={() => {}} copied={false} />
+        <Topbar
+          roomId={roomId}
+          net={net}
+          onCopy={() => {}}
+          copied={false}
+          onLeave={onLeave}
+          onToggleChat={() => {}}
+          showChatToggle={false}
+        />
         <div className="main" style={{ gridTemplateColumns: '1fr' }}>
           <div className="table-wrap">
             <div className="table">
@@ -147,7 +165,15 @@ export function Game({
 
   return (
     <div className="room">
-      <Topbar roomId={roomId} net={net} onCopy={copyLink} copied={copied} />
+      <Topbar
+        roomId={roomId}
+        net={net}
+        onCopy={copyLink}
+        copied={copied}
+        onLeave={onLeave}
+        onToggleChat={() => setDrawerOpen((v) => !v)}
+        showChatToggle
+      />
 
       <div className="main">
         <div className="table-wrap">
@@ -238,9 +264,17 @@ export function Game({
           </div>
         </div>
 
+        {drawerOpen && (
+          <div
+            className="sidebar-backdrop"
+            onClick={() => setDrawerOpen(false)}
+          />
+        )}
         <Sidebar
           state={state}
           onSendChat={(text) => net.dispatch({ type: 'chat', text })}
+          mobileOpen={drawerOpen}
+          onClose={() => setDrawerOpen(false)}
         />
       </div>
 
@@ -264,20 +298,36 @@ function Topbar({
   net,
   onCopy,
   copied,
+  onLeave,
+  onToggleChat,
+  showChatToggle,
 }: {
   roomId: string;
   net: ReturnType<typeof usePeerNet>;
   onCopy: () => void;
   copied: boolean;
+  onLeave: () => void;
+  onToggleChat: () => void;
+  showChatToggle: boolean;
 }) {
   return (
     <div className="topbar">
       <span className="logo">♠ CARRÉ</span>
       <span className="roomcode">
-        room <b>{roomId}</b>
+        <b>{roomId}</b>
         {net.isHost && <span className="badge" style={{ marginLeft: 8 }}>host</span>}
       </span>
       <div className="spacer" />
+
+      {showChatToggle && (
+        <button
+          className="icon-btn mobile-only"
+          onClick={onToggleChat}
+          title="Team chat & log"
+        >
+          💬
+        </button>
+      )}
 
       {net.needsReloadForMic ? (
         <button
@@ -285,23 +335,30 @@ function Topbar({
           onClick={() => window.location.reload()}
           title="Grant mic permission and reconnect"
         >
-          🔇 Enable mic
+          🔇<span className="lbl"> Enable mic</span>
         </button>
       ) : (
         <button
           className={`icon-btn ${net.micOn ? 'on' : 'muted'}`}
           onClick={net.toggleMic}
+          title={net.micOn ? 'Mute microphone' : 'Unmute microphone'}
         >
-          {net.micOn ? '🎙️ Mic on' : '🔇 Muted'}
+          {net.micOn ? '🎙️' : '🔇'}
+          <span className="lbl">{net.micOn ? ' Mic on' : ' Muted'}</span>
         </button>
       )}
 
       <button className="icon-btn" onClick={net.unlockAudio} title="If you can't hear anyone">
-        🔊 Sound
+        🔊<span className="lbl"> Sound</span>
       </button>
 
-      <button className="icon-btn" onClick={onCopy}>
-        {copied ? '✓ Copied' : '🔗 Invite'}
+      <button className="icon-btn" onClick={onCopy} title="Copy invite link">
+        {copied ? '✓' : '🔗'}
+        <span className="lbl">{copied ? ' Copied' : ' Invite'}</span>
+      </button>
+
+      <button className="icon-btn danger-btn" onClick={onLeave} title="Leave room">
+        🚪<span className="lbl"> Leave</span>
       </button>
     </div>
   );

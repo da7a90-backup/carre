@@ -6,9 +6,13 @@ import type { StateView } from '@/lib/protocol';
 export function Sidebar({
   state,
   onSendChat,
+  mobileOpen = false,
+  onClose,
 }: {
   state: StateView;
   onSendChat: (text: string) => void;
+  mobileOpen?: boolean;
+  onClose?: () => void;
 }) {
   const [tab, setTab] = useState<'chat' | 'log'>('chat');
   const [text, setText] = useState('');
@@ -27,7 +31,7 @@ export function Sidebar({
   };
 
   return (
-    <div className="sidebar">
+    <div className={`sidebar${mobileOpen ? ' open' : ''}`}>
       <div className="tabs">
         <button
           className={tab === 'chat' ? 'active' : ''}
@@ -40,6 +44,9 @@ export function Sidebar({
           onClick={() => setTab('log')}
         >
           📜 Game log
+        </button>
+        <button className="drawer-close mobile-only" onClick={onClose} aria-label="Close">
+          ✕
         </button>
       </div>
 

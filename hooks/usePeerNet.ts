@@ -15,6 +15,10 @@ const GRACE_MS = 60_000; // keep a disconnected player's seat this long
 const CONNECT_TIMEOUT_MS = 3000; // per attempt to reach the host
 const MAX_HOST_CONNECT_ATTEMPTS = 4; // then assume host is gone and claim it
 const MAX_BROKER_FAILS = 3; // before surfacing a signaling-server error
+const PING_MS = 4000; // client heartbeat interval
+const PRESENCE_TIMEOUT_MS = 12_000; // host marks silent peers as gone
+const PRESENCE_CHECK_MS = 3000; // host presence sweep interval
+const DEAD_ICE = ['disconnected', 'failed', 'closed'];
 
 export type NetStatus = 'connecting' | 'connected' | 'host-missing' | 'error';
 
@@ -34,6 +38,7 @@ export interface PeerNet {
   isHost: boolean;
   state: StateView | null;
   dispatch: (action: Action) => void;
+  leave: () => void;
   micAvailable: boolean;
   micOn: boolean;
   toggleMic: () => void;
@@ -44,7 +49,6 @@ export interface PeerNet {
   unlockAudio: () => void;
 }
 
-// Optional self-hosted broker, set at build time via NEXT_PUBLIC_PEER_* env vars.
 function brokerOptions(): PeerOptions {
   const host = process.env.NEXT_PUBLIC_PEER_HOST;
   if (!host) return {};
@@ -75,11 +79,13 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
   nameRef.current = name;
 
   const peerRef = useRef<Peer | null>(null);
-  const roleRef = useRef<'host' | 'client' | null>(null);
   const engineRef = useRef<RoomEngine | null>(null);
   const hostConnRef = useRef<DataConnection | null>(null);
   const connsRef = useRef<Map<string, AttachedConn>>(new Map());
   const graceRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const lastSeenRef = useRef<Map<string, number>>(new Map());
+  const presenceIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const myPeerIdRef = useRef('');
   const localStreamRef = useRef<MediaStream | null>(null);
   const emptyStreamRef = useRef<MediaStream | null>(null);
@@ -90,7 +96,6 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
   const rafRef = useRef<number | null>(null);
   const audioElsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
 
-  // ---- host broadcast ----
   const hostBroadcast = useCallback(() => {
     const eng = engineRef.current;
     if (!eng) return;
@@ -118,6 +123,37 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
     },
     [pid, hostBroadcast],
   );
+
+  const leave = useCallback(() => {
+    const conn = hostConnRef.current;
+    if (conn && conn.open && !engineRef.current) {
+      try {
+        conn.send({ k: 'bye' } as NetMessage);
+      } catch {
+        /* ignore */
+      }
+    }
+  }, []);
+
+  // best-effort "bye" when the tab is closed
+  useEffect(() => {
+    const onUnload = () => {
+      const conn = hostConnRef.current;
+      if (conn && conn.open && !engineRef.current) {
+        try {
+          conn.send({ k: 'bye' } as NetMessage);
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+    window.addEventListener('pagehide', onUnload);
+    window.addEventListener('beforeunload', onUnload);
+    return () => {
+      window.removeEventListener('pagehide', onUnload);
+      window.removeEventListener('beforeunload', onUnload);
+    };
+  }, []);
 
   // ---- speaking analysis ----
   const ensureAudioCtx = useCallback(() => {
@@ -206,7 +242,7 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
     setMicOn(track.enabled);
   }, []);
 
-  // ---- main lifecycle: mic → ICE → robust host election ----
+  // ---- main lifecycle: mic → ICE → robust election → presence ----
   useEffect(() => {
     let disposed = false;
     let brokerFails = 0;
@@ -253,7 +289,6 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
     };
 
     const run = async () => {
-      // 1) mic first, so every call carries the track.
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation: true, noiseSuppression: true },
@@ -273,7 +308,6 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
       }
       emptyStreamRef.current = new MediaStream();
 
-      // 2) ICE servers (Cloudflare TURN + Google STUN, or STUN-only fallback).
       const iceConfig = await getIce();
       if (disposed) return;
 
@@ -282,15 +316,10 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
       if (disposed) return;
 
       const HOST_ID = `carre-v1-${roomId}`;
-      const baseOpts: PeerOptions = {
-        debug: 0,
-        config: iceConfig,
-        ...brokerOptions(),
-      };
+      const baseOpts: PeerOptions = { debug: 0, config: iceConfig, ...brokerOptions() };
       const makePeer = (id?: string): Peer =>
         id ? new PeerCtor(id, baseOpts) : new PeerCtor(baseOpts);
 
-      // Never call reconnect() on a destroyed/disposed peer (that throws).
       const safeReconnect = (peer: Peer) => {
         if (disposed || peer.destroyed) return;
         try {
@@ -312,21 +341,81 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
 
       // ---------- HOST ----------
       const becomeHost = (peer: Peer) => {
-        roleRef.current = 'host';
+        engineRef.current = null; // replaced below; also stops client paths
         setIsHost(true);
         hostConnRef.current = null;
+        if (pingIntervalRef.current) {
+          clearInterval(pingIntervalRef.current);
+          pingIntervalRef.current = null;
+        }
         const eng = new RoomEngine(roomId);
         engineRef.current = eng;
         eng.join(pid, nameRef.current, myPeerIdRef.current);
+        lastSeenRef.current.clear();
+        lastSeenRef.current.set(pid, Date.now());
         setStatus('connected');
         setStatusDetail('');
 
+        const startGrace = (dpid: string) => {
+          const prev = graceRef.current.get(dpid);
+          if (prev) clearTimeout(prev);
+          graceRef.current.set(
+            dpid,
+            setTimeout(() => {
+              graceRef.current.delete(dpid);
+              if (!eng.isConnected(dpid)) {
+                eng.remove(dpid);
+                lastSeenRef.current.delete(dpid);
+                hostBroadcast();
+              }
+            }, GRACE_MS),
+          );
+        };
+        const markDisc = (dpid: string) => {
+          if (!eng.isConnected(dpid)) return;
+          eng.setConnected(dpid, false);
+          hostBroadcast();
+          startGrace(dpid);
+        };
+        const removeNow = (dpid: string) => {
+          const g = graceRef.current.get(dpid);
+          if (g) {
+            clearTimeout(g);
+            graceRef.current.delete(dpid);
+          }
+          const c = connsRef.current.get(dpid);
+          if (c) {
+            try {
+              c.close();
+            } catch {}
+            connsRef.current.delete(dpid);
+          }
+          lastSeenRef.current.delete(dpid);
+          eng.remove(dpid);
+          hostBroadcast();
+        };
+
         peer.on('connection', (conn: AttachedConn) => {
           conn.on('data', (raw) => {
+            const dpid = conn.__pid;
+            if (dpid) {
+              lastSeenRef.current.set(dpid, Date.now());
+              if (!eng.isConnected(dpid)) {
+                // revive: any traffic proves they're back
+                eng.setConnected(dpid, true);
+                const g = graceRef.current.get(dpid);
+                if (g) {
+                  clearTimeout(g);
+                  graceRef.current.delete(dpid);
+                }
+                hostBroadcast();
+              }
+            }
             const msg = raw as NetMessage;
             if (msg.k === 'hello') {
               conn.__pid = msg.pid;
               connsRef.current.set(msg.pid, conn);
+              lastSeenRef.current.set(msg.pid, Date.now());
               const g = graceRef.current.get(msg.pid);
               if (g) {
                 clearTimeout(g);
@@ -334,32 +423,37 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
               }
               eng.join(msg.pid, msg.name, msg.peerId);
               hostBroadcast();
+            } else if (msg.k === 'bye' && conn.__pid) {
+              removeNow(conn.__pid);
             } else if (msg.k === 'action' && conn.__pid) {
               eng.apply(conn.__pid, msg.action);
               hostBroadcast();
             }
           });
+          conn.on('iceStateChanged', (st: string) => {
+            if (conn.__pid && DEAD_ICE.includes(st)) markDisc(conn.__pid);
+          });
           conn.on('close', () => {
             const dpid = conn.__pid;
             if (!dpid) return;
             if (connsRef.current.get(dpid) === conn) connsRef.current.delete(dpid);
-            eng.setConnected(dpid, false);
-            hostBroadcast();
-            const prev = graceRef.current.get(dpid);
-            if (prev) clearTimeout(prev);
-            graceRef.current.set(
-              dpid,
-              setTimeout(() => {
-                graceRef.current.delete(dpid);
-                if (!eng.isConnected(dpid)) {
-                  eng.remove(dpid);
-                  hostBroadcast();
-                }
-              }, GRACE_MS),
-            );
+            markDisc(dpid);
           });
           conn.on('error', () => {});
         });
+
+        // Presence sweep: drop peers that stop sending heartbeats.
+        if (presenceIntervalRef.current) clearInterval(presenceIntervalRef.current);
+        presenceIntervalRef.current = setInterval(() => {
+          const now = Date.now();
+          lastSeenRef.current.set(pid, now); // self is always alive
+          for (const [dpid, seen] of lastSeenRef.current) {
+            if (dpid === pid) continue;
+            if (eng.isConnected(dpid) && now - seen > PRESENCE_TIMEOUT_MS) {
+              markDisc(dpid);
+            }
+          }
+        }, PRESENCE_CHECK_MS);
 
         hostBroadcast();
       };
@@ -403,6 +497,17 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
       };
 
       // ---------- CLIENT ----------
+      const startPinging = (conn: DataConnection) => {
+        if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
+        pingIntervalRef.current = setInterval(() => {
+          if (conn.open) {
+            try {
+              conn.send({ k: 'ping' } as NetMessage);
+            } catch {}
+          }
+        }, PING_MS);
+      };
+
       const connectToHost = (peer: Peer, attempt: number) => {
         if (disposed) return;
         const conn = peer.connect(HOST_ID, { reliable: true });
@@ -435,6 +540,7 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
           } as NetMessage);
           setStatus('connected');
           setStatusDetail('');
+          startPinging(conn);
         });
         conn.on('data', (raw) => {
           const msg = raw as NetMessage;
@@ -442,6 +548,10 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
         });
         conn.on('close', () => {
           clearTimeout(timeout);
+          if (pingIntervalRef.current) {
+            clearInterval(pingIntervalRef.current);
+            pingIntervalRef.current = null;
+          }
           if (disposed || hostConnRef.current !== conn) return;
           setStatus('host-missing');
           later(() => {
@@ -455,9 +565,12 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
 
       const joinAsClient = () => {
         if (disposed) return;
-        roleRef.current = 'client';
-        setIsHost(false);
         engineRef.current = null;
+        setIsHost(false);
+        if (presenceIntervalRef.current) {
+          clearInterval(presenceIntervalRef.current);
+          presenceIntervalRef.current = null;
+        }
         setStatus('connecting');
         const peer = makePeer();
         peerRef.current = peer;
@@ -475,7 +588,7 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
         peer.on('disconnected', () => safeReconnect(peer));
         peer.on('error', (err: { type?: string }) => {
           if (err.type === 'peer-unavailable') {
-            // host not reachable this instant — connectToHost retry handles it
+            // connectToHost retry handles it
           } else if (networkish(err.type)) {
             noteBrokerFail();
             try {
@@ -501,6 +614,8 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
       for (const t of retryTimers) clearTimeout(t);
       for (const t of graceRef.current.values()) clearTimeout(t);
       graceRef.current.clear();
+      if (presenceIntervalRef.current) clearInterval(presenceIntervalRef.current);
+      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
       for (const call of callsRef.current.values()) call.close();
       callsRef.current.clear();
       hostConnRef.current?.close();
@@ -514,7 +629,7 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, pid]);
 
-  // ---- audio mesh: dial peers we learn about from state ----
+  // ---- audio mesh ----
   useEffect(() => {
     const peer = peerRef.current;
     if (!peer || !state) return;
@@ -537,7 +652,7 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
     }
   }, [state, attachRemote, removeRemote]);
 
-  // ---- hidden audio elements per remote stream ----
+  // ---- hidden audio elements ----
   useEffect(() => {
     for (const [peerId, el] of audioElsRef.current) {
       if (!remoteStreams[peerId]) {
@@ -569,6 +684,7 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
     isHost,
     state,
     dispatch,
+    leave,
     micAvailable,
     micOn,
     toggleMic,

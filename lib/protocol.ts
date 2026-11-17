@@ -58,4 +58,6 @@ export type Action =
 export type NetMessage =
   | { k: 'hello'; pid: string; name: string; peerId: string }
   | { k: 'action'; action: Action }
-  | { k: 'state'; state: StateView };
+  | { k: 'state'; state: StateView }
+  | { k: 'ping' } // client → host liveness heartbeat
+  | { k: 'bye' }; // client → host graceful leave
