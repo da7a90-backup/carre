@@ -15,6 +15,10 @@ const ICE = {
   ],
 };
 
+const GRACE_MS = 60_000; // keep a disconnected player's seat this long
+const CONNECT_TIMEOUT_MS = 3000; // per attempt to reach the host
+const MAX_HOST_CONNECT_ATTEMPTS = 4; // then assume host is gone and claim it
+
 export type NetStatus = 'connecting' | 'connected' | 'host-missing' | 'error';
 
 interface Options {
@@ -32,13 +36,12 @@ export interface PeerNet {
   isHost: boolean;
   state: StateView | null;
   dispatch: (action: Action) => void;
-  // audio
   micAvailable: boolean;
   micOn: boolean;
   toggleMic: () => void;
   needsReloadForMic: boolean;
-  remoteStreams: Record<string, MediaStream>; // peerId -> stream
-  speaking: Record<string, boolean>; // peerId (or 'self') -> speaking
+  remoteStreams: Record<string, MediaStream>;
+  speaking: Record<string, boolean>;
   myPeerId: string;
   unlockAudio: () => void;
 }
@@ -58,15 +61,16 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
   nameRef.current = name;
 
   const peerRef = useRef<Peer | null>(null);
+  const roleRef = useRef<'host' | 'client' | null>(null);
   const engineRef = useRef<RoomEngine | null>(null);
   const hostConnRef = useRef<DataConnection | null>(null);
   const connsRef = useRef<Map<string, AttachedConn>>(new Map());
+  const graceRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const myPeerIdRef = useRef('');
   const localStreamRef = useRef<MediaStream | null>(null);
   const emptyStreamRef = useRef<MediaStream | null>(null);
   const callsRef = useRef<Map<string, MediaConnection>>(new Map());
 
-  // speaking detection
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analysersRef = useRef<Map<string, AnalyserNode>>(new Map());
   const rafRef = useRef<number | null>(null);
@@ -101,7 +105,7 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
     [pid, hostBroadcast],
   );
 
-  // ---- speaking analysis loop ----
+  // ---- speaking analysis ----
   const ensureAudioCtx = useCallback(() => {
     if (!audioCtxRef.current) {
       const Ctx = window.AudioContext || (window as any).webkitAudioContext;
@@ -138,11 +142,9 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
           const v = (buf[i] - 128) / 128;
           sum += v * v;
         }
-        const rms = Math.sqrt(sum / buf.length);
-        next[key] = rms > 0.045;
+        next[key] = Math.sqrt(sum / buf.length) > 0.045;
       }
       setSpeaking((prev) => {
-        // only update when something changed to avoid re-renders
         const keys = new Set([...Object.keys(prev), ...Object.keys(next)]);
         for (const k of keys) if ((prev[k] || false) !== (next[k] || false)) return next;
         return prev;
@@ -155,7 +157,6 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
     };
   }, []);
 
-  // ---- remote media helpers ----
   const attachRemote = useCallback(
     (peerId: string, stream: MediaStream) => {
       setRemoteStreams((prev) => ({ ...prev, [peerId]: stream }));
@@ -176,9 +177,7 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
 
   const unlockAudio = useCallback(() => {
     audioCtxRef.current?.resume?.();
-    for (const el of audioElsRef.current.values()) {
-      el.play().catch(() => {});
-    }
+    for (const el of audioElsRef.current.values()) el.play().catch(() => {});
   }, []);
 
   const toggleMic = useCallback(() => {
@@ -193,19 +192,33 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
     setMicOn(track.enabled);
   }, []);
 
-  // ---- main lifecycle ----
+  // ---- main lifecycle: mic, then robust host election ----
   useEffect(() => {
-    let destroyed = false;
-    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let disposed = false;
+    const retryTimers = new Set<ReturnType<typeof setTimeout>>();
+
+    const later = (fn: () => void, ms: number) => {
+      const t = setTimeout(() => {
+        retryTimers.delete(t);
+        if (!disposed) fn();
+      }, ms);
+      retryTimers.add(t);
+      return t;
+    };
+    const networkish = (type?: string) =>
+      type === 'network' ||
+      type === 'server-error' ||
+      type === 'socket-error' ||
+      type === 'socket-closed';
 
     const run = async () => {
-      // 1) acquire mic BEFORE any call so every connection carries the track.
+      // 1) mic first, so every call carries the track.
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation: true, noiseSuppression: true },
           video: false,
         });
-        if (destroyed) {
+        if (disposed) {
           stream.getTracks().forEach((t) => t.stop());
           return;
         }
@@ -221,14 +234,13 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
 
       const mod = await import('peerjs');
       const PeerCtor = mod.default;
-      if (destroyed) return;
+      if (disposed) return;
 
-      const hostId = `carre-v1-${roomId}`;
-
+      const HOST_ID = `carre-v1-${roomId}`;
       const makePeer = (id?: string): Peer =>
         id
-          ? new PeerCtor(id, { debug: 1, config: ICE })
-          : new PeerCtor({ debug: 1, config: ICE });
+          ? new PeerCtor(id, { debug: 0, config: ICE })
+          : new PeerCtor({ debug: 0, config: ICE });
 
       const setupCallAnswering = (peer: Peer) => {
         peer.on('call', (call) => {
@@ -240,11 +252,14 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
         });
       };
 
-      const initHost = (peer: Peer) => {
+      // ---------- HOST ----------
+      const becomeHost = (peer: Peer) => {
+        roleRef.current = 'host';
+        setIsHost(true);
+        hostConnRef.current = null;
         const eng = new RoomEngine(roomId);
         engineRef.current = eng;
         eng.join(pid, nameRef.current, myPeerIdRef.current);
-        setIsHost(true);
         setStatus('connected');
 
         peer.on('connection', (conn: AttachedConn) => {
@@ -253,6 +268,11 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
             if (msg.k === 'hello') {
               conn.__pid = msg.pid;
               connsRef.current.set(msg.pid, conn);
+              const g = graceRef.current.get(msg.pid);
+              if (g) {
+                clearTimeout(g);
+                graceRef.current.delete(msg.pid);
+              }
               eng.join(msg.pid, msg.name, msg.peerId);
               hostBroadcast();
             } else if (msg.k === 'action' && conn.__pid) {
@@ -261,11 +281,24 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
             }
           });
           conn.on('close', () => {
-            if (conn.__pid) {
-              connsRef.current.delete(conn.__pid);
-              eng.setConnected(conn.__pid, false);
-              hostBroadcast();
-            }
+            const dpid = conn.__pid;
+            if (!dpid) return;
+            if (connsRef.current.get(dpid) === conn) connsRef.current.delete(dpid);
+            eng.setConnected(dpid, false);
+            hostBroadcast();
+            const prev = graceRef.current.get(dpid);
+            if (prev) clearTimeout(prev);
+            graceRef.current.set(
+              dpid,
+              setTimeout(() => {
+                graceRef.current.delete(dpid);
+                // only remove if they never reconnected
+                if (!eng.isConnected(dpid)) {
+                  eng.remove(dpid);
+                  hostBroadcast();
+                }
+              }, GRACE_MS),
+            );
           });
           conn.on('error', () => {});
         });
@@ -273,11 +306,70 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
         hostBroadcast();
       };
 
-      const initClient = (peer: Peer) => {
-        setIsHost(false);
-        const conn = peer.connect(hostId, { reliable: true });
+      const claimHost = () => {
+        if (disposed) return;
+        setStatus('connecting');
+        const peer = makePeer(HOST_ID);
+        peerRef.current = peer;
+        let decided = false;
+        peer.on('open', (id) => {
+          if (disposed) {
+            peer.destroy();
+            return;
+          }
+          decided = true;
+          myPeerIdRef.current = id;
+          setMyPeerId(id);
+          setupCallAnswering(peer);
+          becomeHost(peer);
+        });
+        peer.on('disconnected', () => {
+          if (!disposed) peer.reconnect();
+        });
+        peer.on('error', (err: { type?: string }) => {
+          if (decided) return;
+          if (err.type === 'unavailable-id') {
+            decided = true;
+            try {
+              peer.destroy();
+            } catch {}
+            joinAsClient();
+          } else if (networkish(err.type)) {
+            decided = true;
+            try {
+              peer.destroy();
+            } catch {}
+            later(claimHost, 1500);
+          }
+        });
+      };
+
+      // ---------- CLIENT ----------
+      const connectToHost = (peer: Peer, attempt: number) => {
+        if (disposed) return;
+        const conn = peer.connect(HOST_ID, { reliable: true });
         hostConnRef.current = conn;
+        let opened = false;
+        const timeout = later(() => {
+          if (opened) return;
+          try {
+            conn.close();
+          } catch {}
+          if (attempt + 1 < MAX_HOST_CONNECT_ATTEMPTS) {
+            connectToHost(peer, attempt + 1);
+          } else {
+            // Host seems gone — try to take over as host.
+            setStatus('host-missing');
+            try {
+              peer.destroy();
+            } catch {}
+            claimHost();
+          }
+        }, CONNECT_TIMEOUT_MS);
+
         conn.on('open', () => {
+          opened = true;
+          clearTimeout(timeout);
           conn.send({
             k: 'hello',
             pid,
@@ -291,75 +383,66 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
           if (msg.k === 'state') setState(msg.state);
         });
         conn.on('close', () => {
-          if (!destroyed) setStatus('host-missing');
+          clearTimeout(timeout);
+          if (disposed || hostConnRef.current !== conn) return;
+          setStatus('host-missing');
+          later(() => {
+            if (disposed) return;
+            if (peer.destroyed) {
+              claimHost();
+            } else {
+              connectToHost(peer, 0);
+            }
+          }, 1200);
         });
         conn.on('error', () => {
-          if (!destroyed) setStatus('host-missing');
+          // open-timeout / close handlers drive recovery
         });
       };
 
-      const becomeClient = () => {
+      const joinAsClient = () => {
+        if (disposed) return;
+        roleRef.current = 'client';
+        setIsHost(false);
+        engineRef.current = null;
+        setStatus('connecting');
         const peer = makePeer();
         peerRef.current = peer;
-        setupCallAnswering(peer);
         peer.on('open', (id) => {
-          if (destroyed) {
+          if (disposed) {
             peer.destroy();
             return;
           }
           myPeerIdRef.current = id;
           setMyPeerId(id);
-          initClient(peer);
+          setupCallAnswering(peer);
+          connectToHost(peer, 0);
+        });
+        peer.on('disconnected', () => {
+          if (!disposed) peer.reconnect();
         });
         peer.on('error', (err: { type?: string }) => {
           if (err.type === 'peer-unavailable') {
-            // Host id vanished (host left). Try to claim host after a beat.
-            setStatus('host-missing');
-            if (!destroyed) {
-              retryTimer = setTimeout(() => {
-                if (destroyed) return;
-                peer.destroy();
-                tryHost();
-              }, 2500);
-            }
-          } else if (err.type !== 'unavailable-id') {
-            setStatus('error');
+            // host not reachable this instant — connectToHost retry handles it
+          } else if (networkish(err.type)) {
+            try {
+              peer.destroy();
+            } catch {}
+            later(joinAsClient, 1500);
           }
         });
       };
 
-      const tryHost = () => {
-        const peer = makePeer(hostId);
-        peerRef.current = peer;
-        setupCallAnswering(peer);
-        peer.on('open', (id) => {
-          if (destroyed) {
-            peer.destroy();
-            return;
-          }
-          myPeerIdRef.current = id;
-          setMyPeerId(id);
-          initHost(peer);
-        });
-        peer.on('error', (err: { type?: string }) => {
-          if (err.type === 'unavailable-id') {
-            // Someone already hosts this room → become a client.
-            peer.destroy();
-            if (!destroyed) becomeClient();
-          } else if (err.type === 'network' || err.type === 'server-error') {
-            setStatus('error');
-          }
-        });
-      };
-
-      tryHost();
+      claimHost();
     };
 
     run();
 
     return () => {
-      destroyed = true;
-      if (retryTimer) clearTimeout(retryTimer);
+      disposed = true;
+      for (const t of retryTimers) clearTimeout(t);
+      for (const t of graceRef.current.values()) clearTimeout(t);
+      graceRef.current.clear();
       for (const call of callsRef.current.values()) call.close();
       callsRef.current.clear();
       hostConnRef.current?.close();
@@ -379,27 +462,27 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
     if (!peer || !state) return;
     const me = myPeerIdRef.current;
     if (!me) return;
+    const liveIds = new Set<string>();
     for (const p of state.players) {
       if (!p.peerId || p.peerId === me || !p.connected) continue;
+      liveIds.add(p.peerId);
       if (callsRef.current.has(p.peerId)) continue;
-      // deterministic initiator to avoid double-calling
       if (me < p.peerId) {
         const outStream =
           localStreamRef.current ?? emptyStreamRef.current ?? new MediaStream();
         const call = peer.call(p.peerId, outStream);
         if (!call) continue;
         callsRef.current.set(p.peerId, call);
-        const pid2 = p.peerId;
-        call.on('stream', (remote) => attachRemote(pid2, remote));
-        call.on('close', () => removeRemote(pid2));
-        call.on('error', () => removeRemote(pid2));
+        const target = p.peerId;
+        call.on('stream', (remote) => attachRemote(target, remote));
+        call.on('close', () => removeRemote(target));
+        call.on('error', () => removeRemote(target));
       }
     }
   }, [state, attachRemote, removeRemote]);
 
-  // ---- render hidden audio elements for each remote stream ----
+  // ---- hidden audio elements per remote stream ----
   useEffect(() => {
-    // prune elements for streams that went away
     for (const [peerId, el] of audioElsRef.current) {
       if (!remoteStreams[peerId]) {
         el.srcObject = null;

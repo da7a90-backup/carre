@@ -179,11 +179,15 @@ export function Game({
           {/* your hand */}
           <div className="hand-dock">
             <div className="pass-hint">
-              {state.phase === 'lobby' && canStart && (
+              {state.phase === 'lobby' && canStart && net.isHost && (
                 <button className="btn ghost" onClick={() => net.dispatch({ type: 'start' })}>
                   ▶ Deal &amp; start the round
                 </button>
               )}
+              {state.phase === 'lobby' &&
+                canStart &&
+                !net.isHost &&
+                'All 4 seated — waiting for the host to start the round…'}
               {state.phase === 'lobby' && !canStart && 'Waiting for 4 players to begin…'}
               {isPlaying &&
                 myTurn &&

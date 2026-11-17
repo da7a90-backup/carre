@@ -79,8 +79,14 @@ export function Seat({
         {isSelf && <span className="you-tag">(you)</span>}
       </div>
       <div className="role">
-        {ROLE_LABEL[role]}
-        {isTurn ? ' · has the extra card' : ''}
+        {!player.connected ? (
+          <span style={{ color: 'var(--danger)' }}>Reconnecting…</span>
+        ) : (
+          <>
+            {ROLE_LABEL[role]}
+            {isTurn ? ' · has the extra card' : ''}
+          </>
+        )}
       </div>
 
       {player.handCount > 0 && (

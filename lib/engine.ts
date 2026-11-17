@@ -70,7 +70,17 @@ export class RoomEngine {
       if (name) existing.name = name;
       return;
     }
-    const seat = this.nextFreeSeat();
+    let seat = this.nextFreeSeat();
+    if (seat < 0 && this.phase === 'lobby') {
+      // Table looks full but a seat is held by a disconnected ghost — reclaim it.
+      const ghost = this.seated().find((p) => !p.connected);
+      if (ghost) {
+        seat = ghost.seat;
+        this.players.delete(ghost.pid);
+        delete this.hands[ghost.pid];
+        this.push(`${ghost.name} left; ${name || 'a new player'} took the seat.`);
+      }
+    }
     this.players.set(pid, {
       pid,
       name: name || `Player ${this.players.size + 1}`,
@@ -88,6 +98,31 @@ export class RoomEngine {
       p.connected = connected;
       if (!connected) this.push(`${p.name} disconnected.`);
     }
+  }
+
+  /** Permanently remove a player (called by the host after the grace window). */
+  remove(pid: string): void {
+    const p = this.players.get(pid);
+    if (!p) return;
+    const wasSeated = p.seat >= 0;
+    this.players.delete(pid);
+    delete this.hands[pid];
+    if (wasSeated && this.phase !== 'lobby') {
+      // A seat emptied mid-round — the round can't continue fairly.
+      this.phase = 'lobby';
+      this.turnSeat = -1;
+      this.result = null;
+      this.revealedHands = null;
+      this.hands = {};
+      for (const q of this.players.values()) q.emoji = null;
+      this.log = [`${p.name} left — the round was cancelled. Back to the lobby.`];
+    } else {
+      this.push(`${p.name} left the table.`);
+    }
+  }
+
+  isConnected(pid: string): boolean {
+    return this.players.get(pid)?.connected ?? false;
   }
 
   pids(): string[] {
