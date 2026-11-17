@@ -1,23 +1,20 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { DataConnection, MediaConnection, Peer } from 'peerjs';
+import type { DataConnection, MediaConnection, Peer, PeerOptions } from 'peerjs';
 import { RoomEngine } from '@/lib/engine';
 import type { Action, NetMessage, StateView } from '@/lib/protocol';
 
-// Google STUN servers for NAT traversal (no TURN — direct P2P; most home/office
-// networks traverse fine. Strict/symmetric NATs would need a TURN relay).
-const ICE = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-  ],
-};
+const GOOGLE_STUN = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+];
 
 const GRACE_MS = 60_000; // keep a disconnected player's seat this long
 const CONNECT_TIMEOUT_MS = 3000; // per attempt to reach the host
 const MAX_HOST_CONNECT_ATTEMPTS = 4; // then assume host is gone and claim it
+const MAX_BROKER_FAILS = 3; // before surfacing a signaling-server error
 
 export type NetStatus = 'connecting' | 'connected' | 'host-missing' | 'error';
 
@@ -33,6 +30,7 @@ interface AttachedConn extends DataConnection {
 
 export interface PeerNet {
   status: NetStatus;
+  statusDetail: string;
   isHost: boolean;
   state: StateView | null;
   dispatch: (action: Action) => void;
@@ -46,8 +44,24 @@ export interface PeerNet {
   unlockAudio: () => void;
 }
 
+// Optional self-hosted broker, set at build time via NEXT_PUBLIC_PEER_* env vars.
+function brokerOptions(): PeerOptions {
+  const host = process.env.NEXT_PUBLIC_PEER_HOST;
+  if (!host) return {};
+  return {
+    host,
+    port: process.env.NEXT_PUBLIC_PEER_PORT
+      ? Number(process.env.NEXT_PUBLIC_PEER_PORT)
+      : 443,
+    path: process.env.NEXT_PUBLIC_PEER_PATH || '/',
+    secure: process.env.NEXT_PUBLIC_PEER_SECURE !== 'false',
+    key: process.env.NEXT_PUBLIC_PEER_KEY || 'peerjs',
+  };
+}
+
 export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
   const [status, setStatus] = useState<NetStatus>('connecting');
+  const [statusDetail, setStatusDetail] = useState('');
   const [isHost, setIsHost] = useState(false);
   const [state, setState] = useState<StateView | null>(null);
   const [micAvailable, setMicAvailable] = useState(false);
@@ -192,9 +206,10 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
     setMicOn(track.enabled);
   }, []);
 
-  // ---- main lifecycle: mic, then robust host election ----
+  // ---- main lifecycle: mic → ICE → robust host election ----
   useEffect(() => {
     let disposed = false;
+    let brokerFails = 0;
     const retryTimers = new Set<ReturnType<typeof setTimeout>>();
 
     const later = (fn: () => void, ms: number) => {
@@ -210,6 +225,32 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
       type === 'server-error' ||
       type === 'socket-error' ||
       type === 'socket-closed';
+
+    const noteBrokerFail = () => {
+      brokerFails += 1;
+      if (brokerFails >= MAX_BROKER_FAILS) {
+        setStatus('error');
+        setStatusDetail(
+          'Can’t reach the signaling server (0.peerjs.com). It may be blocked by an ad-blocker, privacy browser, VPN, or your network. Try disabling blockers, switching networks, or using another device/browser.',
+        );
+      }
+    };
+
+    const getIce = async (): Promise<{ iceServers: RTCIceServer[] }> => {
+      try {
+        const ctrl = new AbortController();
+        const to = setTimeout(() => ctrl.abort(), 5000);
+        const res = await fetch('/api/ice', { signal: ctrl.signal });
+        clearTimeout(to);
+        if (res.ok) {
+          const data = await res.json();
+          if (data?.iceServers?.length) return { iceServers: data.iceServers };
+        }
+      } catch {
+        /* fall through */
+      }
+      return { iceServers: GOOGLE_STUN };
+    };
 
     const run = async () => {
       // 1) mic first, so every call carries the track.
@@ -232,15 +273,32 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
       }
       emptyStreamRef.current = new MediaStream();
 
+      // 2) ICE servers (Cloudflare TURN + Google STUN, or STUN-only fallback).
+      const iceConfig = await getIce();
+      if (disposed) return;
+
       const mod = await import('peerjs');
       const PeerCtor = mod.default;
       if (disposed) return;
 
       const HOST_ID = `carre-v1-${roomId}`;
+      const baseOpts: PeerOptions = {
+        debug: 0,
+        config: iceConfig,
+        ...brokerOptions(),
+      };
       const makePeer = (id?: string): Peer =>
-        id
-          ? new PeerCtor(id, { debug: 0, config: ICE })
-          : new PeerCtor({ debug: 0, config: ICE });
+        id ? new PeerCtor(id, baseOpts) : new PeerCtor(baseOpts);
+
+      // Never call reconnect() on a destroyed/disposed peer (that throws).
+      const safeReconnect = (peer: Peer) => {
+        if (disposed || peer.destroyed) return;
+        try {
+          peer.reconnect();
+        } catch {
+          /* ignore */
+        }
+      };
 
       const setupCallAnswering = (peer: Peer) => {
         peer.on('call', (call) => {
@@ -261,6 +319,7 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
         engineRef.current = eng;
         eng.join(pid, nameRef.current, myPeerIdRef.current);
         setStatus('connected');
+        setStatusDetail('');
 
         peer.on('connection', (conn: AttachedConn) => {
           conn.on('data', (raw) => {
@@ -292,7 +351,6 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
               dpid,
               setTimeout(() => {
                 graceRef.current.delete(dpid);
-                // only remove if they never reconnected
                 if (!eng.isConnected(dpid)) {
                   eng.remove(dpid);
                   hostBroadcast();
@@ -318,14 +376,13 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
             return;
           }
           decided = true;
+          brokerFails = 0;
           myPeerIdRef.current = id;
           setMyPeerId(id);
           setupCallAnswering(peer);
           becomeHost(peer);
         });
-        peer.on('disconnected', () => {
-          if (!disposed) peer.reconnect();
-        });
+        peer.on('disconnected', () => safeReconnect(peer));
         peer.on('error', (err: { type?: string }) => {
           if (decided) return;
           if (err.type === 'unavailable-id') {
@@ -336,6 +393,7 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
             joinAsClient();
           } else if (networkish(err.type)) {
             decided = true;
+            noteBrokerFail();
             try {
               peer.destroy();
             } catch {}
@@ -358,7 +416,6 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
           if (attempt + 1 < MAX_HOST_CONNECT_ATTEMPTS) {
             connectToHost(peer, attempt + 1);
           } else {
-            // Host seems gone — try to take over as host.
             setStatus('host-missing');
             try {
               peer.destroy();
@@ -377,6 +434,7 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
             peerId: myPeerIdRef.current,
           } as NetMessage);
           setStatus('connected');
+          setStatusDetail('');
         });
         conn.on('data', (raw) => {
           const msg = raw as NetMessage;
@@ -388,16 +446,11 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
           setStatus('host-missing');
           later(() => {
             if (disposed) return;
-            if (peer.destroyed) {
-              claimHost();
-            } else {
-              connectToHost(peer, 0);
-            }
+            if (peer.destroyed) claimHost();
+            else connectToHost(peer, 0);
           }, 1200);
         });
-        conn.on('error', () => {
-          // open-timeout / close handlers drive recovery
-        });
+        conn.on('error', () => {});
       };
 
       const joinAsClient = () => {
@@ -413,18 +466,18 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
             peer.destroy();
             return;
           }
+          brokerFails = 0;
           myPeerIdRef.current = id;
           setMyPeerId(id);
           setupCallAnswering(peer);
           connectToHost(peer, 0);
         });
-        peer.on('disconnected', () => {
-          if (!disposed) peer.reconnect();
-        });
+        peer.on('disconnected', () => safeReconnect(peer));
         peer.on('error', (err: { type?: string }) => {
           if (err.type === 'peer-unavailable') {
             // host not reachable this instant — connectToHost retry handles it
           } else if (networkish(err.type)) {
+            noteBrokerFail();
             try {
               peer.destroy();
             } catch {}
@@ -436,7 +489,12 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
       claimHost();
     };
 
-    run();
+    run().catch(() => {
+      if (!disposed) {
+        setStatus('error');
+        setStatusDetail('Unexpected error starting the connection. Please reload.');
+      }
+    });
 
     return () => {
       disposed = true;
@@ -462,10 +520,8 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
     if (!peer || !state) return;
     const me = myPeerIdRef.current;
     if (!me) return;
-    const liveIds = new Set<string>();
     for (const p of state.players) {
       if (!p.peerId || p.peerId === me || !p.connected) continue;
-      liveIds.add(p.peerId);
       if (callsRef.current.has(p.peerId)) continue;
       if (me < p.peerId) {
         const outStream =
@@ -509,6 +565,7 @@ export function usePeerNet({ roomId, pid, name }: Options): PeerNet {
 
   return {
     status,
+    statusDetail,
     isHost,
     state,
     dispatch,

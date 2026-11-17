@@ -44,10 +44,20 @@ export function Game({
                     {net.status === 'host-missing'
                       ? 'Reconnecting to the table…'
                       : net.status === 'error'
-                        ? 'Connection trouble. Check your network and reload.'
+                        ? net.statusDetail || 'Connection trouble. Please reload.'
                         : 'Connecting to the table'}
                   </div>
-                  <div className="dots" />
+                  {net.status === 'error' ? (
+                    <button
+                      className="btn"
+                      style={{ width: 'auto', marginTop: 12 }}
+                      onClick={() => window.location.reload()}
+                    >
+                      ↻ Reload
+                    </button>
+                  ) : (
+                    <div className="dots" />
+                  )}
                 </div>
               </div>
             </div>
